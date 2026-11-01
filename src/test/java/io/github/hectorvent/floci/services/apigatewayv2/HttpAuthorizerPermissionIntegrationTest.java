@@ -11,6 +11,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
 import io.restassured.specification.RequestSpecification;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -34,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -81,18 +84,7 @@ class HttpAuthorizerPermissionIntegrationTest {
         cleanup.register(gateway::close);
         String name = "http-permission-" + UUID.randomUUID().toString().substring(0, 8);
         String arn = "arn:aws:lambda:" + targetRegion + ":" + targetOwner + ":function:" + name + ":live";
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
-            zip.putNextEntry(new ZipEntry("index.js"));
-            zip.write("exports.handler = async () => ({});".getBytes(StandardCharsets.UTF_8));
-            zip.closeEntry();
-        }
-        cleanup.register(() -> lambdaRequest(targetOwner, targetRegion)
-                .delete("/2015-03-31/functions/" + name).then().statusCode(204));
-        lambdaRequest(targetOwner, targetRegion).body(Map.of("FunctionName", name, "Runtime", "nodejs20.x",
-                "Handler", "index.handler", "Role", "arn:aws:iam::" + targetOwner + ":role/lambda-role",
-                "Code", Map.of("ZipFile", Base64.getEncoder().encodeToString(bytes.toByteArray()))))
-                .post("/2015-03-31/functions").then().statusCode(201);
+        createFunction(targetOwner, targetRegion, name, cleanup);
         lambdaRequest(targetOwner, targetRegion).body("{}")
                 .post("/2015-03-31/functions/" + name + "/versions").then().statusCode(201);
         lambdaRequest(targetOwner, targetRegion).body(Map.of("Name", "live", "FunctionVersion", "1"))
@@ -117,6 +109,49 @@ class HttpAuthorizerPermissionIntegrationTest {
             return new InvokeResult(200, null, payload.getBytes(StandardCharsets.UTF_8), null, "permission-test");
         }).when(lambda).invokeTarget(eq(REGION), eq(arn), any(byte[].class), eq(InvocationType.RequestResponse));
         return new Fixture(name, api, arn, targetOwner, targetRegion, auth);
+    }
+
+    private void createFunction(String targetOwner, String targetRegion, String name,
+                                PartitionCleanup ownedCleanup) throws Exception {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
+            zip.putNextEntry(new ZipEntry("index.js"));
+            zip.write("exports.handler = async () => ({});".getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+        }
+        lambdaRequest(targetOwner, targetRegion).body(Map.of("FunctionName", name, "Runtime", "nodejs20.x",
+                "Handler", "index.handler", "Role", "arn:aws:iam::" + targetOwner + ":role/lambda-role",
+                "Code", Map.of("ZipFile", Base64.getEncoder().encodeToString(bytes.toByteArray()))))
+                .post("/2015-03-31/functions").then().statusCode(201);
+        ownedCleanup.register(() -> lambdaRequest(targetOwner, targetRegion)
+                .delete("/2015-03-31/functions/" + name).then().statusCode(204));
+    }
+
+    @Test
+    void duplicateFunctionCreationDoesNotDeleteExistingFunction() throws Exception {
+        String name = "http-authorizer-existing-" + UUID.randomUUID();
+        createFunction(OWNER, REGION, name, cleanup);
+        PartitionCleanup attempted = new PartitionCleanup();
+        try {
+            AssertionError failure = assertThrows(AssertionError.class,
+                    () -> createFunction(OWNER, REGION, name, attempted));
+            assertTrue(failure.getMessage().contains("409"), failure.getMessage());
+        } finally {
+            attempted.afterEach(mock(ExtensionContext.class));
+        }
+        lambdaRequest(OWNER, REGION).get("/2015-03-31/functions/" + name).then().statusCode(200);
+    }
+
+    @Test
+    void successfulFunctionCreationRegistersCleanup() throws Exception {
+        String name = "http-authorizer-owned-" + UUID.randomUUID();
+        PartitionCleanup owned = new PartitionCleanup();
+        try {
+            createFunction(OWNER, REGION, name, owned);
+        } finally {
+            owned.afterEach(mock(ExtensionContext.class));
+        }
+        lambdaRequest(OWNER, REGION).get("/2015-03-31/functions/" + name).then().statusCode(404);
     }
 
     private static void add(Fixture fixture, Grant grant) {
